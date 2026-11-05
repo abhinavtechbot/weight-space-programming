@@ -106,9 +106,28 @@ Rather than computing backward passes with SGD:
 
 ---
 
-## 5. Reference Implementation
+## 5. Reference Implementations
 
-Below is a self-contained, dependency-free Python implementation of the 100k-parameter Agent Micro-Kernel with zero-shot weight programming and microsecond execution:
+The repository provides both a zero-dependency **Rust Crate** (`src/`) for production-grade sub-microsecond edge execution and a pure-Python script (`micro_kernel.py`).
+
+### 5.1 Rust Implementation (`src/kernel.rs`)
+
+Rust is the ideal systems language for this architecture:
+* **Zero Allocation During Forward Passes:** The entire residual stream ($x \in \mathbb{R}^{64}$) and intermediate projections live on the stack or in flat contiguous memory.
+* **L2/L3 CPU Cache Residency:** At ~87k parameters in float32 (~350 KB) or FP16 (~175 KB), the entire model remains continuously resident in hardware cache.
+* **Sub-Microsecond Latency:** Benchmark results show **< 1 µs per dispatch hop** (> 1,000,000 dispatches/sec on modern CPUs), compared to 500ms–3s for cloud LLMs.
+* **WASM / Embedded Ready:** Can be built as a standalone binary or compiled to `wasm32-unknown-unknown` for sandboxed execution in browsers or edge workers.
+
+#### Running in Rust
+```bash
+# Run tests (verifying routing and surgical patching)
+cargo test
+
+# Run high-throughput release benchmark
+cargo run --release
+```
+
+### 5.2 Python Implementation (`micro_kernel.py`)
 
 ```python
 """

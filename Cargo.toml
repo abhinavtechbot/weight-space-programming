@@ -1,0 +1,16 @@
+[package]
+name = "weight-space-microkernel"
+version = "0.1.0"
+edition = "2021"
+description = "Weight-space programmed 100k-parameter neural micro-kernel for reactive agents (OpenClaw)"
+authors = ["OpenClaw / Weight-Space Research"]
+license = "Apache-2.0"
+
+[dependencies]
+# Zero mandatory external dependencies to keep the binary standalone and sub-millisecond fast.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
