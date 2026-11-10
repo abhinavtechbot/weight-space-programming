@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A local demo of a weight-written bulb selector and real LLM tool calling."""
+"""Compare a weight-written text circuit, a keyword baseline and an LLM."""
 import json
 import os
 from pathlib import Path
@@ -23,8 +23,8 @@ TOOLS = [{'type': 'function', 'function': {'name': 'turn_on_' + bulb,
           'description': 'Turn on the ' + bulb + ' bulb.', 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}}
          for bulb in BULBS]
 
-def tokenize(text):
-    """Deliberately limited, inspectable preprocessing; never claims to be an LLM."""
+def keyword_baseline(text):
+    """The original external keyword matcher, retained as a comparison."""
     words = set(re.findall(r"[a-z]+", text.lower()))
     action = bool(words & {'light', 'illuminate', 'activate', 'turn', 'switch', 'on'})
     # Negation and off requests are unsupported, rather than silently firing tools.
@@ -43,11 +43,12 @@ def execute_tools(calls):
         panel[bulb] = True
     return [bulb for bulb in BULBS if panel[bulb]]
 
-def run_transformer(text):
-    tokens = tokenize(text)
+def run_circuit(text):
     start_total = time.perf_counter()
-    result = subprocess.run([str(BINARY), *(tokens or ['none'])], check=True, capture_output=True, text=True, timeout=15)
-    bits, elapsed_ns = result.stdout.strip().split()
+    result = subprocess.run([str(BINARY)], input=text, check=True, capture_output=True, text=True, timeout=15)
+    lines = result.stdout.splitlines()
+    bits, elapsed_ns = lines[0].split()
+    tokens = lines[1].split(' | ') if len(lines) > 1 and lines[1] else []
     if len(bits) != 3 or any(bit not in '01' for bit in bits): raise ValueError('Invalid transformer output')
     selected = [bulb for bulb, bit in zip(BULBS, bits) if bit == '1']
     calls = ['turn_on_' + name for name in selected]
@@ -120,10 +121,13 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             return self.reply(400, {'error': 'Enter a request of 1–500 characters.'})
         try:
-            transformer = run_transformer(text)
+            circuit = run_circuit(text)
         except (OSError, subprocess.SubprocessError, ValueError):
-            return self.reply(500, {'error': 'Transformer execution failed. Build the release binary first.'})
-        self.reply(200, {'transformer': transformer, 'llm': run_llm(text)})
+            return self.reply(500, {'error': 'Text circuit execution failed. Build the release binary first.'})
+        start = time.perf_counter()
+        baseline = keyword_baseline(text)
+        baseline_ms = (time.perf_counter() - start) * 1000
+        self.reply(200, {'transformer': circuit, 'baseline': {'bulbs': baseline, 'elapsed_ms': baseline_ms}, 'llm': run_llm(text)})
 
 if __name__ == '__main__':
     print('Serving http://127.0.0.1:8765', flush=True)
