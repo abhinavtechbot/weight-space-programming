@@ -2,7 +2,7 @@
 
 This repository is a standalone research prototype for directly programming a small transformer in weight space. It implements a bounded routing task without training or an external model: given a sequence of event tokens, the transformer returns Search, Bash, Oracle, or NoRoute.
 
-The project does **not** execute tools, integrate with OpenClaw, parse natural language, enforce a security policy, or implement an agent state machine. These are possible future research directions. Its routing circuit is an experiment, not a production guardrail. In particular, the input danger flag is supplied by the caller, and the example edit deliberately disables its override.
+The original routing circuit does **not** execute tools, integrate with OpenClaw, parse natural language, enforce a security policy, or implement an agent state machine. The separate bulb demo executes virtual bulb functions, using a simple text matcher before its transformer. These circuits are experiments, not production guardrails. In particular, the original input danger flag is supplied by the caller, and its example edit deliberately disables the override.
 
 ## Architecture
 
@@ -33,12 +33,12 @@ Install a current stable Rust toolchain, then:
 
 ```sh
 cargo test
-cargo run --release
+cargo run --release --bin weight-space-microkernel
 ```
 
-For the live comparison, run `bash run-comparison.sh`. It builds the release transformer and starts a server at `http://127.0.0.1:8765`. The script uses the Infisical CLI and dev project configured in `~/Developer/adk-course-dev` by default (override with `INFISICAL_CLI` and `INFISICAL_PROJECT_DIR`). It uses `INFISICAL_TOKEN` if set, otherwise looks for the `weight-space-infisical` entry in the macOS Keychain. If neither is present, sign in to Infisical when prompted. `OPENROUTER_API_KEY` remains on the server, and `OPENROUTER_MODEL` can override the default `google/gemini-2.5-flash`. Each LLM comparison makes a billable API request. The eight-case suite makes eight requests. Anyone with access to the server can trigger those requests.
+For the live comparison, run `bash run-comparison.sh`. It builds the release transformer and starts a server at `http://127.0.0.1:8765`. The script uses the Infisical CLI and dev project configured in `~/Developer/adk-course-dev` by default (override with `INFISICAL_CLI` and `INFISICAL_PROJECT_DIR`). It uses `INFISICAL_TOKEN` if set, otherwise looks for the `weight-space-infisical` entry in the macOS Keychain. If neither is present, sign in to Infisical when prompted. `OPENROUTER_API_KEY` remains on the server, and `OPENROUTER_MODEL` can override the default `google/gemini-2.5-flash`. Each LLM comparison makes a billable API request. Anyone with access to the server can trigger those requests.
 
-The demo runs the actual Rust transformer and compares its output to the same fixed contract given to an OpenRouter model. The Rust measurement covers only the forward pass; OpenRouter timing includes the API round trip, so those measurements have different boundaries. The circuit consumes structured tokens, not natural language, and the suite is illustrative rather than a general benchmark.
+The bulb demo sends the same text to two paths. A deliberately limited keyword matcher feeds left/middle/right tokens into the hand-written `ToolSelector` transformer; its three independent outputs select virtual bulb functions. An OpenRouter model receives the original text and the same three tool definitions, and its returned tool calls update a separate panel. Inputs start with all bulbs off. The Rust forward-pass measurement excludes text matching and process startup, while OpenRouter timing includes the API round trip. The circuit consumes structured tokens, not natural language; examples are illustrative rather than a general benchmark.
 
 The executable prints representative decisions and times 1,000 alternating short inputs using `black_box`. The benchmark reports OS, architecture, build profile, elapsed time and average latency. Results are machine-specific and cover only those short inputs, not maximum-length inputs or a production workload.
 

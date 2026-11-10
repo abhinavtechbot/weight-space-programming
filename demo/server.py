@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Local demo server. Run through Infisical; never send its key to the browser."""
+"""A local demo of a weight-written bulb selector and real LLM tool calling."""
 import json
 import os
 from pathlib import Path
+import re
 import ssl
 import subprocess
 import time
@@ -17,11 +18,75 @@ CERT_BUNDLE = '/etc/ssl/cert.pem'
 TLS_CONTEXT = (ssl.create_default_context(cafile=CERT_BUNDLE)
                if ssl.get_default_verify_paths().cafile is None and Path(CERT_BUNDLE).is_file()
                else ssl.create_default_context())
-RULES = ('Route a sequence of event tokens according to these exact rules. '
-         'If Bash and Danger are present, return Oracle. Otherwise if Bash is present, '
-         'return Bash. Otherwise if Search is present, return Search. Otherwise return NoRoute. '
-         'Order and repetition do not matter; Other is inert. '
-         'Return exactly one word: Search, Bash, Oracle, or NoRoute. No explanation.')
+BULBS = ('left', 'middle', 'right')
+TOOLS = [{'type': 'function', 'function': {'name': 'turn_on_' + bulb,
+          'description': 'Turn on the ' + bulb + ' bulb.', 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}}
+         for bulb in BULBS]
+
+def tokenize(text):
+    """Deliberately limited, inspectable preprocessing; never claims to be an LLM."""
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    action = bool(words & {'light', 'illuminate', 'activate', 'turn', 'switch', 'on'})
+    # Negation and off requests are unsupported, rather than silently firing tools.
+    unsupported = bool(words & {'off', 'not', 'never', 'dont', 'except', 'without'}) or "don't" in text.lower()
+    names = [name for name in BULBS if name in words or (name == 'middle' and 'center' in words)]
+    if 'all' in words and words & {'bulb', 'bulbs', 'lights', 'light'}:
+        names = list(BULBS)
+    return names if action and not unsupported else []
+
+def execute_tools(calls):
+    """Each run has a fresh virtual panel; tool calls update that panel."""
+    panel = dict.fromkeys(BULBS, False)
+    for call in calls:
+        bulb = call.removeprefix('turn_on_')
+        if bulb not in panel: raise ValueError('Unexpected tool')
+        panel[bulb] = True
+    return [bulb for bulb in BULBS if panel[bulb]]
+
+def run_transformer(text):
+    tokens = tokenize(text)
+    start_total = time.perf_counter()
+    result = subprocess.run([str(BINARY), *(tokens or ['none'])], check=True, capture_output=True, text=True, timeout=15)
+    bits, elapsed_ns = result.stdout.strip().split()
+    if len(bits) != 3 or any(bit not in '01' for bit in bits): raise ValueError('Invalid transformer output')
+    selected = [bulb for bulb, bit in zip(BULBS, bits) if bit == '1']
+    calls = ['turn_on_' + name for name in selected]
+    return {'tokens': tokens, 'calls': calls,
+            'bulbs': execute_tools(calls), 'forward_us': int(elapsed_ns) / 1000,
+            'process_ms': (time.perf_counter() - start_total) * 1000}
+
+def run_llm(text):
+    key = os.environ.get('OPENROUTER_API_KEY')
+    if not key:
+        return {'error': 'OPENROUTER_API_KEY is not available through Infisical.'}
+    payload = {'model': MODEL, 'messages': [
+        {'role': 'system', 'content': 'You control three initially off bulbs. Use the available tools to turn on only the bulbs the user asks to light. You may call multiple tools. Do not call a tool for bulbs the user does not want on. If unclear, make no tool call.'},
+        {'role': 'user', 'content': text}], 'tools': TOOLS, 'tool_choice': 'auto',
+        'temperature': 0, 'max_tokens': 256, 'usage': {'include': True}}
+    request = Request('https://openrouter.ai/api/v1/chat/completions', data=json.dumps(payload).encode(),
+                      headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}, method='POST')
+    start = time.perf_counter()
+    try:
+        with urlopen(request, timeout=60, context=TLS_CONTEXT) as response:
+            data = json.load(response)
+        message = data['choices'][0]['message']
+        tool_calls = message.get('tool_calls') or []
+        allowed = {'turn_on_' + name: name for name in BULBS}
+        calls = []
+        for call in tool_calls:
+            function = call.get('function', {})
+            name = function.get('name')
+            if name not in allowed: raise ValueError('Unexpected tool')
+            args = json.loads(function.get('arguments') or '{}')
+            if args != {}: raise ValueError('Unexpected arguments')
+            calls.append(name)
+        return {'calls': calls, 'bulbs': execute_tools(calls), 'message': message.get('content') or '',
+                'elapsed_ms': (time.perf_counter() - start) * 1000,
+                'model': data.get('model', MODEL), 'usage': data.get('usage', {})}
+    except HTTPError as error:
+        return {'error': f'OpenRouter returned HTTP {error.code}.'}
+    except (URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
+        return {'error': 'OpenRouter request failed or returned an unexpected response.'}
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -30,7 +95,6 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path.split('?')[0] == '/api/status':
             return self.reply(200, {'model': MODEL, 'openrouter_configured': bool(os.environ.get('OPENROUTER_API_KEY'))})
-        # Serve only the public demo assets, never server source or local files.
         if self.path.split('?')[0] not in ('/', '/index.html', '/style.css', '/app.js'):
             return self.reply(404, {'error': 'Not found'})
         super().do_GET()
@@ -50,38 +114,16 @@ class Handler(SimpleHTTPRequestHandler):
             return self.reply(415, {'error': 'Content-Type must be application/json.'})
         try:
             length = int(self.headers.get('Content-Length', '0'))
-            if length <= 0 or length > 4096: raise ValueError()
-            body = json.loads(self.rfile.read(length))
-            events = body['events']
-            if not isinstance(events, list) or not 1 <= len(events) <= 63 or any(x not in ('search', 'bash', 'danger', 'other') for x in events): raise ValueError()
-            if not isinstance(body.get('llm', False), bool): raise ValueError()
+            if not 0 < length <= 4096: raise ValueError()
+            text = json.loads(self.rfile.read(length))['text']
+            if not isinstance(text, str) or not text.strip() or len(text) > 500: raise ValueError()
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-            return self.reply(400, {'error': 'Provide 1–63 valid event tokens.'})
+            return self.reply(400, {'error': 'Enter a request of 1–500 characters.'})
         try:
-            out = subprocess.run([str(BINARY), *events], check=True, capture_output=True, text=True, timeout=15)
-            route, elapsed_ns = out.stdout.strip().split()
+            transformer = run_transformer(text)
         except (OSError, subprocess.SubprocessError, ValueError):
             return self.reply(500, {'error': 'Transformer execution failed. Build the release binary first.'})
-        result = {'transformer': {'route': route, 'elapsed_ns': int(elapsed_ns)}}
-        if body.get('llm'):
-            key = os.environ.get('OPENROUTER_API_KEY')
-            if not key:
-                result['llm'] = {'error': 'OPENROUTER_API_KEY is not available through Infisical.'}
-            else:
-                request_body = json.dumps({'model': MODEL, 'messages': [{'role': 'system', 'content': RULES}, {'role': 'user', 'content': 'Events: ' + ', '.join(events)}], 'temperature': 0, 'max_tokens': 128, 'usage': {'include': True}}).encode()
-                req = Request('https://openrouter.ai/api/v1/chat/completions', data=request_body, headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}, method='POST')
-                start = time.perf_counter()
-                try:
-                    with urlopen(req, timeout=60, context=TLS_CONTEXT) as response:
-                        data = json.load(response)
-                    content = data['choices'][0]['message']['content']
-                    if not isinstance(content, str): raise ValueError('missing content')
-                    result['llm'] = {'route': content.strip(), 'elapsed_ms': (time.perf_counter() - start) * 1000, 'model': data.get('model', MODEL), 'usage': data.get('usage', {})}
-                except HTTPError as error:
-                    result['llm'] = {'error': f'OpenRouter returned HTTP {error.code}.'}
-                except (URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
-                    result['llm'] = {'error': 'OpenRouter request failed or returned an unexpected response.'}
-        self.reply(200, result)
+        self.reply(200, {'transformer': transformer, 'llm': run_llm(text)})
 
 if __name__ == '__main__':
     print('Serving http://127.0.0.1:8765', flush=True)

@@ -302,9 +302,107 @@ impl AgentMicroKernel {
     }
 }
 
+/// A separate three-output transformer programmed to select independent bulbs.
+/// Inputs 10..=12 denote left, middle and right bulb requests.
+pub struct ToolSelector {
+    model: AgentMicroKernel,
+}
+
+impl Default for ToolSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolSelector {
+    pub fn new() -> Self {
+        let mut model = AgentMicroKernel::new();
+        model.head = Linear::new(D_MODEL, 3);
+        for i in 0..3 {
+            model.embeddings[(10 + i) * D_MODEL + i] = 1.0;
+            let first = &mut model.blocks[0];
+            first.v.set(i, i, 1.0);
+            first.o.set(i, i, 1.0);
+            first.up.set(i, 2 * i, 1.0);
+            first.up.set(5, 2 * i, -1.0);
+            first.up.set(i, 2 * i + 1, 1.0);
+            first.up.set(5, 2 * i + 1, -1.0);
+            first.up.bias[2 * i + 1] = -0.01;
+            first.down.set(2 * i, 8 + i, 100.0);
+            first.down.set(2 * i + 1, 8 + i, -100.0);
+            let second = &mut model.blocks[1];
+            second.up.set(8 + i, i, 1.0);
+            second.up.set(13, i, -1.0);
+            second.down.set(i, 16 + i, 100.0);
+            model.head.set(16 + i, i, 1.0);
+            model.head.set(22, i, -1.0);
+        }
+        Self { model }
+    }
+
+    /// Returns independent tool selections, not an argmax. Unrecognized input is inert.
+    pub fn forward(&self, tokens: &[usize]) -> Result<[bool; 3], InputError> {
+        if tokens.is_empty() {
+            return Err(InputError::Empty);
+        }
+        if tokens.len() >= MAX_SEQUENCE {
+            return Err(InputError::TooLong {
+                max: MAX_SEQUENCE - 1,
+            });
+        }
+        for (index, &token) in tokens.iter().enumerate() {
+            if token >= VOCAB_SIZE {
+                return Err(InputError::InvalidToken { index, token });
+            }
+            if token == OP_QUERY {
+                return Err(InputError::ReservedToken { index });
+            }
+        }
+        let mut x: Vec<Vec<f32>> = tokens
+            .iter()
+            .copied()
+            .chain(std::iter::once(OP_QUERY))
+            .enumerate()
+            .map(|(pos, tok)| {
+                (0..D_MODEL)
+                    .map(|j| {
+                        self.model.embeddings[tok * D_MODEL + j]
+                            + self.model.positions[pos * D_MODEL + j]
+                    })
+                    .collect()
+            })
+            .collect();
+        for block in &self.model.blocks {
+            block.forward(&mut x);
+        }
+        let last = x.last_mut().expect("query token is present");
+        self.model.final_norm.apply(last);
+        let logits = self.model.head.apply(last);
+        Ok(std::array::from_fn(|i| logits[i] > 1e-5))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tool_selector_all_combinations() {
+        let model = ToolSelector::new();
+        for mask in 0..8 {
+            let mut tokens: Vec<usize> = (0..3)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| 10 + i)
+                .collect();
+            if tokens.is_empty() {
+                tokens.push(1);
+            }
+            assert_eq!(
+                model.forward(&tokens).unwrap(),
+                std::array::from_fn(|i| mask & (1 << i) != 0),
+                "mask {mask}"
+            );
+        }
+    }
     fn programmed() -> AgentMicroKernel {
         let mut k = AgentMicroKernel::new();
         k.program_weights();
