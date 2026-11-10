@@ -2,7 +2,7 @@
 name = "weight-space-microkernel"
 version = "0.1.0"
 edition = "2021"
-description = "Weight-space programmed 100k-parameter neural micro-kernel for reactive agents (OpenClaw)"
+description = "Experimental weight-programmed causal transformer for bounded routing"
 authors = ["OpenClaw / Weight-Space Research"]
 license = "Apache-2.0"
 

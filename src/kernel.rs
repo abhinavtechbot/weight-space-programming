@@ -1,237 +1,403 @@
-//! Agent Micro-Kernel core implementation.
+//! A small causal transformer and a hand-constructed routing program.
 
 pub const D_MODEL: usize = 64;
 pub const D_MLP: usize = 128;
 pub const VOCAB_SIZE: usize = 128;
+pub const MAX_SEQUENCE: usize = 64;
+pub const HEADS: usize = 4;
+const HEAD_DIM: usize = D_MODEL / HEADS;
+const EPS: f32 = 1e-5;
 
-// OpenClaw Event Opcodes
 pub const OP_MSG_SEARCH: usize = 10;
 pub const OP_MSG_BASH: usize = 11;
 pub const FLAG_DANGER: usize = 12;
+/// Reserved internally as the last position, where the routing result is read.
+pub const OP_QUERY: usize = 127;
 
-// Routed Tool Targets
-pub const TOOL_SEARCH: usize = 50;
-pub const TOOL_BASH: usize = 51;
-pub const TOOL_ORACLE: usize = 52;
-
-/// A 100k-parameter neural executive controller.
-/// Total float32 parameters: 87,552 (~350 KB footprint, easily L2/L3 cache-resident).
-pub struct AgentMicroKernel {
-    pub w_emb: Box<[[f32; D_MODEL]; VOCAB_SIZE]>,
-    
-    // Layer 0 Attention (Key-Value associative matcher)
-    pub w_q0: Box<[[f32; D_MODEL]; D_MODEL]>,
-    pub w_k0: Box<[[f32; D_MODEL]; D_MODEL]>,
-    pub w_v0: Box<[[f32; D_MODEL]; D_MODEL]>,
-    pub w_o0: Box<[[f32; D_MODEL]; D_MODEL]>,
-
-    // Layer 0 MLP (Boolean threshold logic gates)
-    pub w_mlp1_0: Box<[[f32; D_MLP]; D_MODEL]>,
-    pub b_mlp1_0: Box<[f32; D_MLP]>,
-    pub w_mlp2_0: Box<[[f32; D_MODEL]; D_MLP]>,
-    pub b_mlp2_0: Box<[f32; D_MODEL]>,
-
-    // Output projection head
-    pub w_head: Box<[[f32; VOCAB_SIZE]; D_MODEL]>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    Search,
+    Bash,
+    Oracle,
+    NoRoute,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputError {
+    Empty,
+    TooLong { max: usize },
+    InvalidToken { index: usize, token: usize },
+    ReservedToken { index: usize },
+}
+
+#[derive(Clone)]
+struct Linear {
+    weights: Vec<f32>,
+    bias: Vec<f32>,
+    input: usize,
+    output: usize,
+}
+impl Linear {
+    fn new(input: usize, output: usize) -> Self {
+        Self {
+            weights: vec![0.0; input * output],
+            bias: vec![0.0; output],
+            input,
+            output,
+        }
+    }
+    fn set(&mut self, i: usize, j: usize, value: f32) {
+        self.weights[i * self.output + j] = value;
+    }
+    fn apply(&self, input: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(input.len(), self.input);
+        let mut out = self.bias.clone();
+        for (i, &v) in input.iter().enumerate() {
+            if v != 0.0 {
+                for (j, x) in out.iter_mut().enumerate() {
+                    *x += v * self.weights[i * self.output + j];
+                }
+            }
+        }
+        out
+    }
+    fn count(&self) -> usize {
+        self.weights.len() + self.bias.len()
+    }
+}
+
+#[derive(Clone)]
+struct Norm {
+    gain: Vec<f32>,
+    bias: Vec<f32>,
+}
+impl Norm {
+    fn new() -> Self {
+        Self {
+            gain: vec![1.0; D_MODEL],
+            bias: vec![0.0; D_MODEL],
+        }
+    }
+    fn apply(&self, x: &mut [f32]) {
+        let mean = x.iter().sum::<f32>() / D_MODEL as f32;
+        let variance = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / D_MODEL as f32;
+        let scale = 1.0 / (variance + EPS).sqrt();
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = (*v - mean) * scale * self.gain[i] + self.bias[i];
+        }
+    }
+    fn count(&self) -> usize {
+        self.gain.len() + self.bias.len()
+    }
+}
+
+#[derive(Clone)]
+struct Block {
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    up: Linear,
+    down: Linear,
+    norm1: Norm,
+    norm2: Norm,
+}
+impl Block {
+    fn new() -> Self {
+        Self {
+            q: Linear::new(D_MODEL, D_MODEL),
+            k: Linear::new(D_MODEL, D_MODEL),
+            v: Linear::new(D_MODEL, D_MODEL),
+            o: Linear::new(D_MODEL, D_MODEL),
+            up: Linear::new(D_MODEL, D_MLP),
+            down: Linear::new(D_MLP, D_MODEL),
+            norm1: Norm::new(),
+            norm2: Norm::new(),
+        }
+    }
+    fn count(&self) -> usize {
+        self.q.count()
+            + self.k.count()
+            + self.v.count()
+            + self.o.count()
+            + self.up.count()
+            + self.down.count()
+            + self.norm1.count()
+            + self.norm2.count()
+    }
+    fn forward(&self, x: &mut [Vec<f32>]) {
+        let queries: Vec<_> = x.iter().map(|v| self.q.apply(v)).collect();
+        let keys: Vec<_> = x.iter().map(|v| self.k.apply(v)).collect();
+        let values: Vec<_> = x.iter().map(|v| self.v.apply(v)).collect();
+        for t in 0..x.len() {
+            let mut context = vec![0.0; D_MODEL];
+            for head in 0..HEADS {
+                let start = head * HEAD_DIM;
+                let mut scores: Vec<f32> = (0..=t)
+                    .map(|s| {
+                        (start..start + HEAD_DIM)
+                            .map(|j| queries[t][j] * keys[s][j])
+                            .sum::<f32>()
+                            / (HEAD_DIM as f32).sqrt()
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                for score in &mut scores {
+                    *score = (*score - max).exp();
+                }
+                let total: f32 = scores.iter().sum();
+                for (s, score) in scores.iter().enumerate() {
+                    for j in start..start + HEAD_DIM {
+                        context[j] += score / total * values[s][j];
+                    }
+                }
+            }
+            let attention = self.o.apply(&context);
+            for (a, b) in x[t].iter_mut().zip(attention) {
+                *a += b;
+            }
+            self.norm1.apply(&mut x[t]);
+            let mut hidden = self.up.apply(&x[t]);
+            for v in &mut hidden {
+                *v = v.max(0.0);
+            }
+            let update = self.down.apply(&hidden);
+            for (a, b) in x[t].iter_mut().zip(update) {
+                *a += b;
+            }
+            self.norm2.apply(&mut x[t]);
+        }
+    }
+}
+
+/// Two-layer, post-normalized causal transformer with a separately programmed circuit.
+#[derive(Clone)]
+pub struct AgentMicroKernel {
+    embeddings: Vec<f32>,
+    positions: Vec<f32>,
+    blocks: [Block; 2],
+    final_norm: Norm,
+    head: Linear,
+}
 impl Default for AgentMicroKernel {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl AgentMicroKernel {
+    /// Constructs zero weights (normalization gains are initialized to one).
     pub fn new() -> Self {
         Self {
-            w_emb: Box::new([[0.0; D_MODEL]; VOCAB_SIZE]),
-            w_q0: Box::new([[0.0; D_MODEL]; D_MODEL]),
-            w_k0: Box::new([[0.0; D_MODEL]; D_MODEL]),
-            w_v0: Box::new([[0.0; D_MODEL]; D_MODEL]),
-            w_o0: Box::new([[0.0; D_MODEL]; D_MODEL]),
-            w_mlp1_0: Box::new([[0.0; D_MLP]; D_MODEL]),
-            b_mlp1_0: Box::new([0.0; D_MLP]),
-            w_mlp2_0: Box::new([[0.0; D_MODEL]; D_MLP]),
-            b_mlp2_0: Box::new([0.0; D_MODEL]),
-            w_head: Box::new([[0.0; VOCAB_SIZE]; D_MODEL]),
+            embeddings: vec![0.0; VOCAB_SIZE * D_MODEL],
+            positions: vec![0.0; MAX_SEQUENCE * D_MODEL],
+            blocks: [Block::new(), Block::new()],
+            final_norm: Norm::new(),
+            head: Linear::new(D_MODEL, 3),
         }
     }
-
-    /// Direct weight-space synthesis (zero-shot, no backprop or training).
-    /// Assembles routing channels, attention matchers, and safety threshold gates.
+    /// Number of stored float parameters, including biases and normalization parameters.
+    pub fn parameter_count(&self) -> usize {
+        self.embeddings.len()
+            + self.positions.len()
+            + self.blocks.iter().map(Block::count).sum::<usize>()
+            + self.final_norm.count()
+            + self.head.count()
+    }
+    /// Reset and directly synthesize the bounded routing circuit, without training.
     pub fn program_weights(&mut self) {
-        // 1. Embedding Projections (Orthogonal subspace mapping)
-        self.w_emb[OP_MSG_SEARCH][16] = 10.0; // Channel 16: Search intent
-        self.w_emb[OP_MSG_BASH][17] = 10.0;   // Channel 17: Bash intent
-        self.w_emb[FLAG_DANGER][32] = 10.0;   // Channel 32: Danger flag
-
-        // 2. Attention Projections (Key-Value associative matching)
-        self.w_q0[16][16] = 1.0;
-        self.w_k0[16][16] = 1.0;
-        self.w_v0[16][20] = 5.0; // Action register: Search
-
-        self.w_q0[17][17] = 1.0;
-        self.w_k0[17][17] = 1.0;
-        self.w_v0[17][21] = 5.0; // Action register: Bash
-
-        self.w_o0[20][20] = 1.0;
-        self.w_o0[21][21] = 1.0;
-
-        // 3. Layer 0 MLP: Boolean AND Gate for Safety Guardrail
-        // Gate fires iff (Bash intent active AND Danger flag active):
-        // 1.0 * x[17] + 1.0 * x[32] - 15.0:
-        // - Safe Bash: 10 + 0 - 15 = -5 <= 0 (Gate inactive)
-        // - Dangerous Bash: 10 + 10 - 15 = +5 > 0 (Gate active -> routes to Oracle)
-        self.w_mlp1_0[17][0] = 1.0;
-        self.w_mlp1_0[32][0] = 1.0;
-        self.b_mlp1_0[0] = -15.0;
-        self.w_mlp2_0[0][22] = 20.0; // Override with Oracle token
-
-        // 4. Output Head (Project Action channels to Tool Tokens)
-        self.w_head[20][TOOL_SEARCH] = 10.0;
-        self.w_head[21][TOOL_BASH] = 10.0;
-        self.w_head[22][TOOL_ORACLE] = 20.0;
-    }
-
-    /// Surgical in-place parameter update (Micro-surgery).
-    /// Adjusts scalar biases or weights directly without retraining the network.
-    pub fn patch_threshold(&mut self, neuron_idx: usize, delta_b: f32) {
-        if neuron_idx < D_MLP {
-            self.b_mlp1_0[neuron_idx] += delta_b;
+        *self = Self::new();
+        for (token, channel) in [(OP_MSG_SEARCH, 0), (OP_MSG_BASH, 1), (FLAG_DANGER, 2)] {
+            self.embeddings[token * D_MODEL + channel] = 1.0;
+        }
+        let first = &mut self.blocks[0];
+        // Zero queries and keys produce uniform causal attention. Copy event channels.
+        for i in 0..3 {
+            first.v.set(i, i, 1.0);
+            first.o.set(i, i, 1.0);
+        }
+        // At the query position, x[i]-x[3] is positive iff that token occurred.
+        // Difference of two ReLUs saturates each presence flag at one.
+        for i in 0..3 {
+            first.up.set(i, 2 * i, 1.0);
+            first.up.set(3, 2 * i, -1.0);
+            first.up.set(i, 2 * i + 1, 1.0);
+            first.up.set(3, 2 * i + 1, -1.0);
+            first.up.bias[2 * i + 1] = -0.01;
+            first.down.set(2 * i, 8 + i, 100.0);
+            first.down.set(2 * i + 1, 8 + i, -100.0);
+        }
+        // An always-on reference lets later gates compare normalized flags.
+        first.down.bias[12] = 1.0;
+        let second = &mut self.blocks[1];
+        // Search iff search and not bash; bash iff bash and not danger;
+        // oracle iff bash and danger. Channels 8..10 are presence flags.
+        for (channel, value) in [(8, 1.0), (9, -1.0)] {
+            second.up.set(channel, 0, value);
+        }
+        for (channel, value) in [(9, 1.0), (10, -1.0)] {
+            second.up.set(channel, 1, value);
+        }
+        for (channel, value) in [(9, 1.0), (10, 1.0), (12, -1.0), (11, -1.0)] {
+            second.up.set(channel, 2, value);
+        }
+        // Each expression has zero coefficient sum, so normalization offsets cancel.
+        for i in 0..3 {
+            second.down.set(i, 16 + i, 100.0);
+            self.head.set(16 + i, i, 1.0);
+            self.head.set(19, i, -1.0);
         }
     }
-
-    /// Sub-microsecond forward pass with zero heap allocation during execution.
-    #[inline(always)]
-    pub fn forward(&self, input_tokens: &[usize]) -> usize {
-        // Stack-allocated state buffer (residual stream)
-        let mut x = [0.0f32; D_MODEL];
-
-        // 1. Embedding lookup & sequence aggregation
-        for &tok in input_tokens {
-            if tok < VOCAB_SIZE {
-                for j in 0..D_MODEL {
-                    x[j] += self.w_emb[tok][j];
-                }
+    /// Disable the experimental danger override by raising its reference threshold.
+    /// A dangerous bash input then produces NoRoute; safe routes are unaffected.
+    pub fn disable_danger_override(&mut self) {
+        self.blocks[1].up.set(12, 2, -3.0);
+        self.blocks[1].up.set(11, 2, 1.0);
+    }
+    /// Evaluate 1..=63 event tokens, followed internally by a reserved query token.
+    pub fn forward(&self, tokens: &[usize]) -> Result<Route, InputError> {
+        if tokens.is_empty() {
+            return Err(InputError::Empty);
+        }
+        if tokens.len() >= MAX_SEQUENCE {
+            return Err(InputError::TooLong {
+                max: MAX_SEQUENCE - 1,
+            });
+        }
+        for (index, &token) in tokens.iter().enumerate() {
+            if token >= VOCAB_SIZE {
+                return Err(InputError::InvalidToken { index, token });
+            }
+            if token == OP_QUERY {
+                return Err(InputError::ReservedToken { index });
             }
         }
-
-        // 2. Self-Attention layer
-        let mut q = [0.0f32; D_MODEL];
-        let mut k = [0.0f32; D_MODEL];
-        let mut v = [0.0f32; D_MODEL];
-
-        for i in 0..D_MODEL {
-            let xi = x[i];
-            if xi != 0.0 {
-                for j in 0..D_MODEL {
-                    q[j] += xi * self.w_q0[i][j];
-                    k[j] += xi * self.w_k0[i][j];
-                    v[j] += xi * self.w_v0[i][j];
-                }
-            }
+        let mut x: Vec<Vec<f32>> = tokens
+            .iter()
+            .copied()
+            .chain(std::iter::once(OP_QUERY))
+            .enumerate()
+            .map(|(pos, tok)| {
+                (0..D_MODEL)
+                    .map(|j| self.embeddings[tok * D_MODEL + j] + self.positions[pos * D_MODEL + j])
+                    .collect()
+            })
+            .collect();
+        for block in &self.blocks {
+            block.forward(&mut x);
         }
-
-        // Simplified single-token self-attention dot product
-        let mut dot = 0.0f32;
-        for i in 0..D_MODEL {
-            dot += q[i] * k[i];
+        let last = x.last_mut().expect("query token is present");
+        self.final_norm.apply(last);
+        let logits = self.head.apply(last);
+        let (index, &value) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        // Roundoff near zero must not turn an absent route into a decision.
+        if value <= 1e-5 {
+            Ok(Route::NoRoute)
+        } else {
+            Ok([Route::Search, Route::Bash, Route::Oracle][index])
         }
-        let score = dot / (D_MODEL as f32).sqrt();
-        let attn = 1.0f32; // Normalized single-step weight
-
-        // Attention output projection
-        for i in 0..D_MODEL {
-            let vi = v[i] * attn;
-            if vi != 0.0 {
-                for j in 0..D_MODEL {
-                    x[j] += vi * self.w_o0[i][j];
-                }
-            }
-        }
-
-        // 3. MLP Layer: ReLU(x @ W1 + b1) @ W2 + b2
-        let mut h = [0.0f32; D_MLP];
-        for j in 0..D_MLP {
-            let mut sum = self.b_mlp1_0[j];
-            for i in 0..D_MODEL {
-                sum += x[i] * self.w_mlp1_0[i][j];
-            }
-            h[j] = if sum > 0.0 { sum } else { 0.0 }; // ReLU activation
-        }
-
-        for j in 0..D_MODEL {
-            let mut sum = self.b_mlp2_0[j];
-            for i in 0..D_MLP {
-                if h[i] != 0.0 {
-                    sum += h[i] * self.w_mlp2_0[i][j];
-                }
-            }
-            x[j] += sum;
-        }
-
-        // 4. Output Head projection & argmax selection
-        let mut best_tok = 0;
-        let mut max_logit = f32::NEG_INFINITY;
-
-        for j in 0..VOCAB_SIZE {
-            let mut logit = 0.0f32;
-            for i in 0..D_MODEL {
-                if x[i] != 0.0 {
-                    logit += x[i] * self.w_head[i][j];
-                }
-            }
-            if logit > max_logit {
-                max_logit = logit;
-                best_tok = j;
-            }
-        }
-
-        best_tok
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_search_routing() {
-        let mut kernel = AgentMicroKernel::new();
-        kernel.program_weights();
-        let tool = kernel.forward(&[OP_MSG_SEARCH]);
-        assert_eq!(tool, TOOL_SEARCH);
+    fn programmed() -> AgentMicroKernel {
+        let mut k = AgentMicroKernel::new();
+        k.program_weights();
+        k
     }
-
     #[test]
-    fn test_safe_bash_routing() {
-        let mut kernel = AgentMicroKernel::new();
-        kernel.program_weights();
-        let tool = kernel.forward(&[OP_MSG_BASH]);
-        assert_eq!(tool, TOOL_BASH);
+    fn dimensions_and_count() {
+        assert_eq!(D_MODEL % HEADS, 0);
+        assert_eq!(programmed().parameter_count(), 79_555);
     }
-
     #[test]
-    fn test_dangerous_bash_override() {
-        let mut kernel = AgentMicroKernel::new();
-        kernel.program_weights();
-        // Passing bash intent together with danger flag triggers Boolean AND gate
-        let tool = kernel.forward(&[OP_MSG_BASH, FLAG_DANGER]);
-        assert_eq!(tool, TOOL_ORACLE);
+    fn routing_and_precedence() {
+        let k = programmed();
+        for (input, expected) in [
+            (vec![OP_MSG_SEARCH], Route::Search),
+            (vec![OP_MSG_BASH], Route::Bash),
+            (vec![OP_MSG_BASH, FLAG_DANGER], Route::Oracle),
+            (vec![FLAG_DANGER, OP_MSG_BASH], Route::Oracle),
+            (vec![OP_MSG_SEARCH, OP_MSG_BASH], Route::Bash),
+            (vec![OP_MSG_SEARCH, FLAG_DANGER], Route::Search),
+            (vec![FLAG_DANGER], Route::NoRoute),
+            (vec![1], Route::NoRoute),
+            (
+                vec![OP_MSG_BASH, OP_MSG_SEARCH, FLAG_DANGER, OP_MSG_BASH],
+                Route::Oracle,
+            ),
+        ] {
+            assert_eq!(k.forward(&input), Ok(expected), "{input:?}");
+        }
     }
-
     #[test]
-    fn test_surgical_patching() {
-        let mut kernel = AgentMicroKernel::new();
-        kernel.program_weights();
-        
-        // Before patch: dangerous bash is intercepted
-        assert_eq!(kernel.forward(&[OP_MSG_BASH, FLAG_DANGER]), TOOL_ORACLE);
-
-        // Surgically disarm danger gate by lowering bias significantly (Δb = -50.0)
-        kernel.patch_threshold(0, -50.0);
-
-        // After patch: even with danger flag, neuron 0 never reaches threshold -> runs Bash
-        assert_eq!(kernel.forward(&[OP_MSG_BASH, FLAG_DANGER]), TOOL_BASH);
+    fn max_length_and_repetition() {
+        let k = programmed();
+        let mut input = vec![1; 63];
+        input[0] = OP_MSG_BASH;
+        input[62] = FLAG_DANGER;
+        assert_eq!(k.forward(&input), Ok(Route::Oracle));
+        assert_eq!(k.forward(&vec![OP_MSG_SEARCH; 63]), Ok(Route::Search));
+    }
+    #[test]
+    fn invalid_inputs() {
+        let k = programmed();
+        assert_eq!(k.forward(&[]), Err(InputError::Empty));
+        assert_eq!(
+            k.forward(&vec![1; 64]),
+            Err(InputError::TooLong { max: 63 })
+        );
+        assert_eq!(
+            k.forward(&[128]),
+            Err(InputError::InvalidToken {
+                index: 0,
+                token: 128
+            })
+        );
+        assert_eq!(
+            k.forward(&[OP_QUERY]),
+            Err(InputError::ReservedToken { index: 0 })
+        );
+    }
+    #[test]
+    fn edit_is_local_to_override() {
+        let mut k = programmed();
+        k.disable_danger_override();
+        assert_eq!(k.forward(&[OP_MSG_BASH, FLAG_DANGER]), Ok(Route::NoRoute));
+        assert_eq!(k.forward(&[OP_MSG_BASH]), Ok(Route::Bash));
+        assert_eq!(k.forward(&[OP_MSG_SEARCH]), Ok(Route::Search));
+    }
+    #[test]
+    fn causal_attention_cannot_see_future() {
+        let mut block = Block::new();
+        block.v.set(0, 0, 1.0);
+        block.o.set(0, 0, 1.0);
+        let mut a = vec![vec![0.0; D_MODEL], vec![0.0; D_MODEL]];
+        let mut b = a.clone();
+        b[1][0] = 9.0;
+        block.forward(&mut a);
+        block.forward(&mut b);
+        assert_eq!(a[0], b[0]);
+    }
+    #[test]
+    fn normalization_is_finite_and_centered() {
+        let norm = Norm::new();
+        let mut x = vec![0.0; D_MODEL];
+        x[0] = 1.0;
+        norm.apply(&mut x);
+        assert!(x.iter().all(|v| v.is_finite()));
+        assert!(x.iter().sum::<f32>().abs() < 1e-4);
+    }
+    #[test]
+    fn position_embedding_is_used() {
+        let mut k = programmed();
+        let baseline = k.forward(&[OP_MSG_SEARCH]).unwrap();
+        k.positions[D_MODEL + 1] = 100.0;
+        assert_ne!(k.forward(&[OP_MSG_SEARCH]).unwrap(), baseline);
     }
 }
